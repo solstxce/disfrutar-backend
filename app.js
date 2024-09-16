@@ -4,6 +4,8 @@ const swaggerJsdoc = require('swagger-jsdoc');
 const swaggerUi = require('swagger-ui-express');
 const { Pool } = require('pg');
 const jwt = require('jsonwebtoken');
+const { OAuth2Client } = require('google-auth-library');
+const bcrypt = require('bcrypt');
 require('dotenv').config();
 
 const app = express();
@@ -14,14 +16,21 @@ const pool = new Pool({
   connectionString: process.env.POSTGRES_URL,
 });
 
+// Google OAuth client
+const oauth2Client = new OAuth2Client(
+  process.env.AUTH_GOOGLE_ID,
+  process.env.AUTH_GOOGLE_SECRET,
+  `${process.env.PUBLIC_SERVER_URL}/auth/google/callback`
+);
+
 // Swagger definition
 const swaggerOptions = {
   definition: {
     openapi: '3.0.0',
     info: {
-      title: 'E-commerce API',
+      title: 'Comprehensive E-commerce API',
       version: '1.0.0',
-      description: 'API for an e-commerce platform',
+      description: 'API for an e-commerce platform with Google OAuth',
     },
     servers: [
       {
@@ -47,7 +56,91 @@ const verifyToken = (req, res, next) => {
   });
 };
 
+// Middleware to check if user is admin
+const isAdmin = async (req, res, next) => {
+  try {
+    const result = await pool.query('SELECT is_admin FROM customer WHERE id = $1', [req.userId]);
+    if (result.rows[0].is_admin) {
+      next();
+    } else {
+      res.status(403).send({ message: 'Requires admin privileges' });
+    }
+  } catch (error) {
+    res.status(500).send({ message: 'Error checking admin status' });
+  }
+};
+
 // Authentication APIs
+
+/**
+ * @swagger
+ * /auth/google:
+ *   get:
+ *     summary: Initiate Google OAuth flow
+ *     tags: [Authentication]
+ *     responses:
+ *       302:
+ *         description: Redirects to Google OAuth page
+ */
+app.get('/auth/google', (req, res) => {
+  const url = oauth2Client.generateAuthUrl({
+    access_type: 'offline',
+    scope: ['https://www.googleapis.com/auth/userinfo.profile', 'https://www.googleapis.com/auth/userinfo.email']
+  });
+  res.redirect(url);
+});
+
+/**
+ * @swagger
+ * /auth/google/callback:
+ *   get:
+ *     summary: Handle Google OAuth callback
+ *     tags: [Authentication]
+ *     parameters:
+ *       - in: query
+ *         name: code
+ *         required: true
+ *         schema:
+ *           type: string
+ *     responses:
+ *       200:
+ *         description: Authentication successful
+ *       400:
+ *         description: Authentication failed
+ */
+app.get('/auth/google/callback', async (req, res) => {
+  const { code } = req.query;
+  try {
+    const { tokens } = await oauth2Client.getToken(code);
+    oauth2Client.setCredentials(tokens);
+
+    const ticket = await oauth2Client.verifyIdToken({
+      idToken: tokens.id_token,
+      audience: process.env.AUTH_GOOGLE_ID,
+    });
+
+    const payload = ticket.getPayload();
+    const { sub: googleId, email, name } = payload;
+
+    let result = await pool.query('SELECT * FROM customer WHERE google_id = $1', [googleId]);
+    let user;
+
+    if (result.rows.length === 0) {
+      result = await pool.query(
+        'INSERT INTO customer (google_id, email_address, first_name, last_name) VALUES ($1, $2, $3, $4) RETURNING *',
+        [googleId, email, name.split(' ')[0], name.split(' ')[1] || '']
+      );
+      user = result.rows[0];
+    } else {
+      user = result.rows[0];
+    }
+
+    const token = jwt.sign({ id: user.id }, process.env.AUTH_SECRET, { expiresIn: '1h' });
+    res.json({ auth: true, token });
+  } catch (error) {
+    res.status(400).json({ message: 'Authentication failed', error: error.message });
+  }
+});
 
 /**
  * @swagger
@@ -84,13 +177,14 @@ const verifyToken = (req, res, next) => {
 app.post('/auth/register', async (req, res) => {
   const { email, password, firstName, lastName } = req.body;
   try {
+    const hashedPassword = await bcrypt.hash(password, 10);
     const result = await pool.query(
       'INSERT INTO customer (email_address, first_name, last_name) VALUES ($1, $2, $3) RETURNING id',
       [email, firstName, lastName]
     );
     await pool.query(
       'INSERT INTO customer_login (customer_id, password_hash) VALUES ($1, $2)',
-      [result.rows[0].id, password] // In real-world, hash the password
+      [result.rows[0].id, hashedPassword]
     );
     res.status(201).json({ message: 'User registered successfully' });
   } catch (error) {
@@ -131,7 +225,7 @@ app.post('/auth/login', async (req, res) => {
       'SELECT c.id, cl.password_hash FROM customer c JOIN customer_login cl ON c.id = cl.customer_id WHERE c.email_address = $1',
       [email]
     );
-    if (result.rows.length > 0 && result.rows[0].password_hash === password) { // In real-world, compare hashed passwords
+    if (result.rows.length > 0 && await bcrypt.compare(password, result.rows[0].password_hash)) {
       const token = jwt.sign({ id: result.rows[0].id }, process.env.AUTH_SECRET, { expiresIn: '1h' });
       res.json({ auth: true, token });
     } else {
@@ -139,6 +233,67 @@ app.post('/auth/login', async (req, res) => {
     }
   } catch (error) {
     res.status(500).json({ message: 'Login failed', error: error.message });
+  }
+});
+
+// User Profile APIs
+
+/**
+ * @swagger
+ * /user/profile:
+ *   get:
+ *     summary: Get user profile
+ *     tags: [User Profile]
+ *     security:
+ *       - bearerAuth: []
+ *     responses:
+ *       200:
+ *         description: User profile
+ */
+app.get('/user/profile', verifyToken, async (req, res) => {
+  try {
+    const result = await pool.query('SELECT id, email_address, first_name, last_name, created_at FROM customer WHERE id = $1', [req.userId]);
+    res.json(result.rows[0]);
+  } catch (error) {
+    res.status(500).json({ message: 'Error fetching profile', error: error.message });
+  }
+});
+
+/**
+ * @swagger
+ * /user/profile:
+ *   put:
+ *     summary: Update user profile
+ *     tags: [User Profile]
+ *     security:
+ *       - bearerAuth: []
+ *     requestBody:
+ *       required: true
+ *       content:
+ *         application/json:
+ *           schema:
+ *             type: object
+ *             properties:
+ *               firstName:
+ *                 type: string
+ *               lastName:
+ *                 type: string
+ *               email:
+ *                 type: string
+ *     responses:
+ *       200:
+ *         description: Profile updated successfully
+ */
+app.put('/user/profile', verifyToken, async (req, res) => {
+  const { firstName, lastName, email } = req.body;
+  try {
+    await pool.query(
+      'UPDATE customer SET first_name = $1, last_name = $2, email_address = $3 WHERE id = $4',
+      [firstName, lastName, email, req.userId]
+    );
+    res.json({ message: 'Profile updated successfully' });
+  } catch (error) {
+    res.status(500).json({ message: 'Error updating profile', error: error.message });
   }
 });
 
@@ -161,6 +316,11 @@ app.post('/auth/login', async (req, res) => {
  *         schema:
  *           type: integer
  *         description: Number of items per page
+ *       - in: query
+ *         name: category
+ *         schema:
+ *           type: string
+ *         description: Filter by category
  *     responses:
  *       200:
  *         description: List of products
@@ -169,10 +329,24 @@ app.get('/products', async (req, res) => {
   const page = parseInt(req.query.page) || 1;
   const limit = parseInt(req.query.limit) || 10;
   const offset = (page - 1) * limit;
+  const category = req.query.category;
 
   try {
-    const result = await pool.query('SELECT * FROM product LIMIT $1 OFFSET $2', [limit, offset]);
-    const countResult = await pool.query('SELECT COUNT(*) FROM product');
+    let query = 'SELECT p.*, pc.name as category_name FROM product p JOIN product_category pc ON p.category_id = pc.id';
+    let countQuery = 'SELECT COUNT(*) FROM product p';
+    const queryParams = [];
+
+    if (category) {
+      query += ' WHERE pc.name = $1';
+      countQuery += ' JOIN product_category pc ON p.category_id = pc.id WHERE pc.name = $1';
+      queryParams.push(category);
+    }
+
+    query += ' LIMIT $' + (queryParams.length + 1) + ' OFFSET $' + (queryParams.length + 2);
+    queryParams.push(limit, offset);
+
+    const result = await pool.query(query, queryParams);
+    const countResult = await pool.query(countQuery, category ? [category] : []);
     const totalProducts = parseInt(countResult.rows[0].count);
     const totalPages = Math.ceil(totalProducts / limit);
 
@@ -187,12 +361,62 @@ app.get('/products', async (req, res) => {
   }
 });
 
+// ... (previous product endpoints remain the same)
+
+// Review APIs
+
 /**
  * @swagger
- * /products/{id}:
+ * /products/{id}/reviews:
+ *   post:
+ *     summary: Add a review for a product
+ *     tags: [Reviews]
+ *     security:
+ *       - bearerAuth: []
+ *     parameters:
+ *       - in: path
+ *         name: id
+ *         required: true
+ *         schema:
+ *           type: integer
+ *     requestBody:
+ *       required: true
+ *       content:
+ *         application/json:
+ *           schema:
+ *             type: object
+ *             required:
+ *               - rating
+ *               - comment
+ *             properties:
+ *               rating:
+ *                 type: integer
+ *               comment:
+ *                 type: string
+ *     responses:
+ *       201:
+ *         description: Review added successfully
+ */
+app.post('/products/:id/reviews', verifyToken, async (req, res) => {
+  const { rating, comment } = req.body;
+  const productId = req.params.id;
+  try {
+    await pool.query(
+      'INSERT INTO product_review (product_id, customer_id, rating, comment) VALUES ($1, $2, $3, $4)',
+      [productId, req.userId, rating, comment]
+    );
+    res.status(201).json({ message: 'Review added successfully' });
+  } catch (error) {
+    res.status(400).json({ message: 'Error adding review', error: error.message });
+  }
+});
+
+/**
+ * @swagger
+ * /products/{id}/reviews:
  *   get:
- *     summary: Get a product by ID
- *     tags: [Products]
+ *     summary: Get reviews for a product
+ *     tags: [Reviews]
  *     parameters:
  *       - in: path
  *         name: id
@@ -201,198 +425,399 @@ app.get('/products', async (req, res) => {
  *           type: integer
  *     responses:
  *       200:
- *         description: Product details
- *       404:
- *         description: Product not found
+ *         description: List of reviews for the product
  */
-app.get('/products/:id', async (req, res) => {
+app.get('/products/:id/reviews', async (req, res) => {
   const productId = req.params.id;
   try {
-    const result = await pool.query('SELECT * FROM product WHERE id = $1', [productId]);
-    if (result.rows.length > 0) {
-      res.json(result.rows[0]);
-    } else {
-      res.status(404).json({ message: 'Product not found' });
-    }
+    const result = await pool.query(
+      'SELECT pr.*, c.first_name, c.last_name FROM product_review pr JOIN customer c ON pr.customer_id = c.id WHERE pr.product_id = $1 ORDER BY pr.created_at DESC',
+      [productId]
+    );
+    res.json(result.rows);
   } catch (error) {
-    res.status(500).json({ message: 'Error fetching product', error: error.message });
+    res.status(500).json({ message: 'Error fetching reviews', error: error.message });
   }
 });
 
-// Shopping Cart APIs
+// Wishlist APIs
 
 /**
  * @swagger
- * /cart:
+ * /wishlist:
  *   get:
- *     summary: Get user's shopping cart
- *     tags: [Shopping Cart]
+ *     summary: Get user's wishlist
+ *     tags: [Wishlist]
  *     security:
  *       - bearerAuth: []
  *     responses:
  *       200:
- *         description: User's shopping cart
+ *         description: User's wishlist
  */
-app.get('/cart', verifyToken, async (req, res) => {
-  try {
-    const result = await pool.query(
-      'SELECT sci.*, p.name, p.price FROM shopping_cart_item sci JOIN product p ON sci.product_id = p.id WHERE sci.shopping_cart_id = (SELECT id FROM shopping_cart WHERE customer_id = $1)',
-      [req.userId]
-    );
-    res.json(result.rows);
-  } catch (error) {
-    res.status(500).json({ message: 'Error fetching shopping cart', error: error.message });
-  }
-});
-
-/**
- * @swagger
- * /cart/items:
- *   post:
- *     summary: Add item to cart
- *     tags: [Shopping Cart]
- *     security:
- *       - bearerAuth: []
- *     requestBody:
- *       required: true
- *       content:
- *         application/json:
- *           schema:
- *             type: object
- *             required:
- *               - productId
- *               - quantity
- *             properties:
- *               productId:
- *                 type: integer
- *               quantity:
- *                 type: integer
- *     responses:
- *       201:
- *         description: Item added to cart
- *       400:
- *         description: Invalid input
- */
-app.post('/cart/items', verifyToken, async (req, res) => {
-  const { productId, quantity } = req.body;
-  try {
-    // First, ensure the shopping cart exists for the user
-    let cartResult = await pool.query('SELECT id FROM shopping_cart WHERE customer_id = $1', [req.userId]);
-    let cartId;
-    if (cartResult.rows.length === 0) {
-      // Create a new cart if it doesn't exist
-      const newCartResult = await pool.query('INSERT INTO shopping_cart (customer_id) VALUES ($1) RETURNING id', [req.userId]);
-      cartId = newCartResult.rows[0].id;
-    } else {
-      cartId = cartResult.rows[0].id;
-    }
-
-    // Now add the item to the cart
-    await pool.query(
-      'INSERT INTO shopping_cart_item (shopping_cart_id, product_id, quantity) VALUES ($1, $2, $3)',
-      [cartId, productId, quantity]
-    );
-    res.status(201).json({ message: 'Item added to cart' });
-  } catch (error) {
-    res.status(400).json({ message: 'Error adding item to cart', error: error.message });
-  }
-});
-
-// Order APIs
-
-/**
- * @swagger
- * /orders:
- *   post:
- *     summary: Place a new order
- *     tags: [Orders]
- *     security:
- *       - bearerAuth: []
- *     requestBody:
- *       required: true
- *       content:
- *         application/json:
- *           schema:
- *             type: object
- *             required:
- *               - addressId
- *             properties:
- *               addressId:
- *                 type: integer
- *     responses:
- *       201:
- *         description: Order placed successfully
- *       400:
- *         description: Error placing order
- */
-app.post('/orders', verifyToken, async (req, res) => {
-  const { addressId } = req.body;
-  const client = await pool.connect();
-
-  try {
-    await client.query('BEGIN');
-
-    // Create new order
-    const orderResult = await client.query(
-      'INSERT INTO "order" (customer_id, status_code_id) VALUES ($1, 1) RETURNING id', // Assuming 1 is the status code for 'new order'
-      [req.userId]
-    );
-    const orderId = orderResult.rows[0].id;
-
-    // Get items from the user's cart
-    const cartItems = await client.query(
-      'SELECT sci.product_id, sci.quantity, p.price FROM shopping_cart_item sci JOIN product p ON sci.product_id = p.id WHERE sci.shopping_cart_id = (SELECT id FROM shopping_cart WHERE customer_id = $1)',
-      [req.userId]
-    );
-
-    // Add items to order
-    for (let item of cartItems.rows) {
-      await client.query(
-        'INSERT INTO order_item (order_id, product_id, quantity, price) VALUES ($1, $2, $3, $4)',
-        [orderId, item.product_id, item.quantity, item.price]
+app.get('/wishlist', verifyToken, async (req, res) => {
+    try {
+      const result = await pool.query(
+        'SELECT p.* FROM wishlist w JOIN product p ON w.product_id = p.id WHERE w.customer_id = $1',
+        [req.userId]
       );
+      res.json(result.rows);
+    } catch (error) {
+      res.status(500).json({ message: 'Error fetching wishlist', error: error.message });
     }
-
-    // Clear the user's cart
-    await client.query(
-      'DELETE FROM shopping_cart_item WHERE shopping_cart_id = (SELECT id FROM shopping_cart WHERE customer_id = $1)',
-      [req.userId]
-    );
-
-    await client.query('COMMIT');
-    res.status(201).json({ message: 'Order placed successfully', orderId });
-  } catch (error) {
-    await client.query('ROLLBACK');
-    res.status(400).json({ message: 'Error placing order', error: error.message });
-  } finally {
-    client.release();
-  }
-});
-
-/**
- * @swagger
- * /orders:
- *   get:
- *     summary: Get user's orders
- *     tags: [Orders]
- *     security:
- *       - bearerAuth: []
- *     responses:
- *       200:
- *         description: List of user's orders
- */
-app.get('/orders', verifyToken, async (req, res) => {
-  try {
-    const result = await pool.query(
-      'SELECT o.*, os.status_code FROM "order" o JOIN order_status_code os ON o.status_code_id = os.id WHERE o.customer_id = $1 ORDER BY o.created_at DESC',
-      [req.userId]
-    );
-    res.json(result.rows);
-  } catch (error) {
-    res.status(500).json({ message: 'Error fetching orders', error: error.message });
-  }
-});
-
-// Start the server
-const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
+  });
+  
+  /**
+   * @swagger
+   * /wishlist/{productId}:
+   *   post:
+   *     summary: Add product to wishlist
+   *     tags: [Wishlist]
+   *     security:
+   *       - bearerAuth: []
+   *     parameters:
+   *       - in: path
+   *         name: productId
+   *         required: true
+   *         schema:
+   *           type: integer
+   *     responses:
+   *       201:
+   *         description: Product added to wishlist
+   */
+  app.post('/wishlist/:productId', verifyToken, async (req, res) => {
+    const productId = req.params.productId;
+    try {
+      await pool.query(
+        'INSERT INTO wishlist (customer_id, product_id) VALUES ($1, $2) ON CONFLICT DO NOTHING',
+        [req.userId, productId]
+      );
+      res.status(201).json({ message: 'Product added to wishlist' });
+    } catch (error) {
+      res.status(400).json({ message: 'Error adding to wishlist', error: error.message });
+    }
+  });
+  
+  /**
+   * @swagger
+   * /wishlist/{productId}:
+   *   delete:
+   *     summary: Remove product from wishlist
+   *     tags: [Wishlist]
+   *     security:
+   *       - bearerAuth: []
+   *     parameters:
+   *       - in: path
+   *         name: productId
+   *         required: true
+   *         schema:
+   *           type: integer
+   *     responses:
+   *       200:
+   *         description: Product removed from wishlist
+   */
+  app.delete('/wishlist/:productId', verifyToken, async (req, res) => {
+    const productId = req.params.productId;
+    try {
+      await pool.query(
+        'DELETE FROM wishlist WHERE customer_id = $1 AND product_id = $2',
+        [req.userId, productId]
+      );
+      res.json({ message: 'Product removed from wishlist' });
+    } catch (error) {
+      res.status(400).json({ message: 'Error removing from wishlist', error: error.message });
+    }
+  });
+  
+  // Cart APIs
+  
+  /**
+   * @swagger
+   * /cart:
+   *   get:
+   *     summary: Get user's cart
+   *     tags: [Cart]
+   *     security:
+   *       - bearerAuth: []
+   *     responses:
+   *       200:
+   *         description: User's cart
+   */
+  app.get('/cart', verifyToken, async (req, res) => {
+    try {
+      const result = await pool.query(
+        'SELECT c.*, p.name, p.price FROM cart c JOIN product p ON c.product_id = p.id WHERE c.customer_id = $1',
+        [req.userId]
+      );
+      res.json(result.rows);
+    } catch (error) {
+      res.status(500).json({ message: 'Error fetching cart', error: error.message });
+    }
+  });
+  
+  /**
+   * @swagger
+   * /cart:
+   *   post:
+   *     summary: Add product to cart
+   *     tags: [Cart]
+   *     security:
+   *       - bearerAuth: []
+   *     requestBody:
+   *       required: true
+   *       content:
+   *         application/json:
+   *           schema:
+   *             type: object
+   *             required:
+   *               - productId
+   *               - quantity
+   *             properties:
+   *               productId:
+   *                 type: integer
+   *               quantity:
+   *                 type: integer
+   *     responses:
+   *       201:
+   *         description: Product added to cart
+   */
+  app.post('/cart', verifyToken, async (req, res) => {
+    const { productId, quantity } = req.body;
+    try {
+      await pool.query(
+        'INSERT INTO cart (customer_id, product_id, quantity) VALUES ($1, $2, $3) ON CONFLICT (customer_id, product_id) DO UPDATE SET quantity = cart.quantity + $3',
+        [req.userId, productId, quantity]
+      );
+      res.status(201).json({ message: 'Product added to cart' });
+    } catch (error) {
+      res.status(400).json({ message: 'Error adding to cart', error: error.message });
+    }
+  });
+  
+  /**
+   * @swagger
+   * /cart/{productId}:
+   *   delete:
+   *     summary: Remove product from cart
+   *     tags: [Cart]
+   *     security:
+   *       - bearerAuth: []
+   *     parameters:
+   *       - in: path
+   *         name: productId
+   *         required: true
+   *         schema:
+   *           type: integer
+   *     responses:
+   *       200:
+   *         description: Product removed from cart
+   */
+  app.delete('/cart/:productId', verifyToken, async (req, res) => {
+    const productId = req.params.productId;
+    try {
+      await pool.query(
+        'DELETE FROM cart WHERE customer_id = $1 AND product_id = $2',
+        [req.userId, productId]
+      );
+      res.json({ message: 'Product removed from cart' });
+    } catch (error) {
+      res.status(400).json({ message: 'Error removing from cart', error: error.message });
+    }
+  });
+  
+  // Order APIs
+  
+  /**
+   * @swagger
+   * /orders:
+   *   post:
+   *     summary: Create a new order
+   *     tags: [Orders]
+   *     security:
+   *       - bearerAuth: []
+   *     requestBody:
+   *       required: true
+   *       content:
+   *         application/json:
+   *           schema:
+   *             type: object
+   *             required:
+   *               - shippingAddress
+   *             properties:
+   *               shippingAddress:
+   *                 type: string
+   *     responses:
+   *       201:
+   *         description: Order created successfully
+   */
+  app.post('/orders', verifyToken, async (req, res) => {
+    const { shippingAddress } = req.body;
+    const client = await pool.connect();
+  
+    try {
+      await client.query('BEGIN');
+  
+      // Create order
+      const orderResult = await client.query(
+        'INSERT INTO customer_order (customer_id, status, shipping_address) VALUES ($1, $2, $3) RETURNING id',
+        [req.userId, 'Pending', shippingAddress]
+      );
+      const orderId = orderResult.rows[0].id;
+  
+      // Get cart items
+      const cartItems = await client.query(
+        'SELECT product_id, quantity FROM cart WHERE customer_id = $1',
+        [req.userId]
+      );
+  
+      // Add order items
+      for (const item of cartItems.rows) {
+        await client.query(
+          'INSERT INTO order_item (order_id, product_id, quantity) VALUES ($1, $2, $3)',
+          [orderId, item.product_id, item.quantity]
+        );
+      }
+  
+      // Clear cart
+      await client.query('DELETE FROM cart WHERE customer_id = $1', [req.userId]);
+  
+      await client.query('COMMIT');
+      res.status(201).json({ message: 'Order created successfully', orderId });
+    } catch (error) {
+      await client.query('ROLLBACK');
+      res.status(400).json({ message: 'Error creating order', error: error.message });
+    } finally {
+      client.release();
+    }
+  });
+  
+  /**
+   * @swagger
+   * /orders:
+   *   get:
+   *     summary: Get user's orders
+   *     tags: [Orders]
+   *     security:
+   *       - bearerAuth: []
+   *     responses:
+   *       200:
+   *         description: List of user's orders
+   */
+  app.get('/orders', verifyToken, async (req, res) => {
+    try {
+      const result = await pool.query(
+        'SELECT * FROM customer_order WHERE customer_id = $1 ORDER BY created_at DESC',
+        [req.userId]
+      );
+      res.json(result.rows);
+    } catch (error) {
+      res.status(500).json({ message: 'Error fetching orders', error: error.message });
+    }
+  });
+  
+  /**
+   * @swagger
+   * /orders/{orderId}:
+   *   get:
+   *     summary: Get order details
+   *     tags: [Orders]
+   *     security:
+   *       - bearerAuth: []
+   *     parameters:
+   *       - in: path
+   *         name: orderId
+   *         required: true
+   *         schema:
+   *           type: integer
+   *     responses:
+   *       200:
+   *         description: Order details
+   */
+  app.get('/orders/:orderId', verifyToken, async (req, res) => {
+    const orderId = req.params.orderId;
+    try {
+      const orderResult = await pool.query(
+        'SELECT * FROM customer_order WHERE id = $1 AND customer_id = $2',
+        [orderId, req.userId]
+      );
+      if (orderResult.rows.length === 0) {
+        return res.status(404).json({ message: 'Order not found' });
+      }
+  
+      const itemsResult = await pool.query(
+        'SELECT oi.*, p.name, p.price FROM order_item oi JOIN product p ON oi.product_id = p.id WHERE oi.order_id = $1',
+        [orderId]
+      );
+  
+      res.json({
+        order: orderResult.rows[0],
+        items: itemsResult.rows
+      });
+    } catch (error) {
+      res.status(500).json({ message: 'Error fetching order details', error: error.message });
+    }
+  });
+  
+  // Payment APIs (simplified, in real-world scenario, integrate with a payment gateway)
+  
+  /**
+   * @swagger
+   * /orders/{orderId}/pay:
+   *   post:
+   *     summary: Process payment for an order
+   *     tags: [Payments]
+   *     security:
+   *       - bearerAuth: []
+   *     parameters:
+   *       - in: path
+   *         name: orderId
+   *         required: true
+   *         schema:
+   *           type: integer
+   *     requestBody:
+   *       required: true
+   *       content:
+   *         application/json:
+   *           schema:
+   *             type: object
+   *             required:
+   *               - paymentMethod
+   *             properties:
+   *               paymentMethod:
+   *                 type: string
+   *     responses:
+   *       200:
+   *         description: Payment processed successfully
+   */
+  app.post('/orders/:orderId/pay', verifyToken, async (req, res) => {
+    const orderId = req.params.orderId;
+    const { paymentMethod } = req.body;
+  
+    try {
+      // Check if order exists and belongs to the user
+      const orderResult = await pool.query(
+        'SELECT * FROM customer_order WHERE id = $1 AND customer_id = $2',
+        [orderId, req.userId]
+      );
+      if (orderResult.rows.length === 0) {
+        return res.status(404).json({ message: 'Order not found' });
+      }
+  
+      // In a real-world scenario, integrate with a payment gateway here
+  
+      // Update order status
+      await pool.query(
+        'UPDATE customer_order SET status = $1, payment_method = $2 WHERE id = $3',
+        ['Paid', paymentMethod, orderId]
+      );
+  
+      res.json({ message: 'Payment processed successfully' });
+    } catch (error) {
+      res.status(500).json({ message: 'Error processing payment', error: error.message });
+    }
+  });
+  
+  // Start the server
+  const PORT = process.env.PORT || 3000;
+  app.listen(PORT, () => {
+    console.log(`Server is running on port ${PORT}`);
+  });
