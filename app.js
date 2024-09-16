@@ -554,32 +554,7 @@ app.get('/wishlist', verifyToken, async (req, res) => {
     }
   });
   
-  /**
-   * @swagger
-   * /cart:
-   *   post:
-   *     summary: Add product to cart
-   *     tags: [Cart]
-   *     security:
-   *       - bearerAuth: []
-   *     requestBody:
-   *       required: true
-   *       content:
-   *         application/json:
-   *           schema:
-   *             type: object
-   *             required:
-   *               - productId
-   *               - quantity
-   *             properties:
-   *               productId:
-   *                 type: integer
-   *               quantity:
-   *                 type: integer
-   *     responses:
-   *       201:
-   *         description: Product added to cart
-   */
+
   app.post('/cart', verifyToken, async (req, res) => {
     const { productId, quantity } = req.body;
     try {
@@ -816,6 +791,225 @@ app.get('/wishlist', verifyToken, async (req, res) => {
     }
   });
   
+
+  // New endpoint: Get low stock alerts
+  app.get('/admin/low-stock-alerts', verifyToken, isAdmin, async (req, res) => {
+    const threshold = req.query.threshold || 10;
+    try {
+      const result = await pool.query(
+        'SELECT id, name, stock_quantity FROM product WHERE stock_quantity <= $1 ORDER BY stock_quantity ASC',
+        [threshold]
+      );
+      res.json(result.rows);
+    } catch (error) {
+      res.status(500).json({ message: 'Error fetching low stock alerts', error: error.message });
+    }
+  });
+
+  // Payment APIs (simplified, in real-world scenario, integrate with a payment gateway)
+
+app.post('/orders/:orderId/pay', verifyToken, async (req, res) => {
+  const orderId = req.params.orderId;
+  const { paymentMethod } = req.body;
+
+  try {
+    // Check if order exists and belongs to the user
+    const orderResult = await pool.query(
+      'SELECT * FROM customer_order WHERE id = $1 AND customer_id = $2',
+      [orderId, req.userId]
+    );
+    if (orderResult.rows.length === 0) {
+      return res.status(404).json({ message: 'Order not found' });
+    }
+
+    // In a real-world scenario, integrate with a payment gateway here
+
+    // Update order status
+    await pool.query(
+      'UPDATE customer_order SET status = $1, payment_method = $2 WHERE id = $3',
+      ['Paid', paymentMethod, orderId]
+    );
+
+    res.json({ message: 'Payment processed successfully' });
+  } catch (error) {
+    res.status(500).json({ message: 'Error processing payment', error: error.message });
+  }
+});
+
+// New endpoint: Get sales report
+app.get('/admin/sales-report', verifyToken, isAdmin, async (req, res) => {
+  const { startDate, endDate } = req.query;
+  try {
+    const result = await pool.query(
+      `SELECT p.id, p.name, SUM(oi.quantity) as total_sold, SUM(oi.quantity * p.price) as revenue
+       FROM order_item oi
+       JOIN product p ON oi.product_id = p.id
+       JOIN customer_order co ON oi.order_id = co.id
+       WHERE co.created_at BETWEEN $1 AND $2
+       GROUP BY p.id, p.name
+       ORDER BY revenue DESC`,
+      [startDate, endDate]
+    );
+    res.json(result.rows);
+  } catch (error) {
+    res.status(500).json({ message: 'Error generating sales report', error: error.message });
+  }
+});
+
+app.post('/orders', verifyToken, async (req, res) => {
+  const { shippingAddress } = req.body;
+  const client = await pool.connect();
+
+  try {
+    await client.query('BEGIN');
+
+    // Create order
+    const orderResult = await client.query(
+      'INSERT INTO customer_order (customer_id, status, shipping_address) VALUES ($1, $2, $3) RETURNING id',
+      [req.userId, 'Pending', shippingAddress]
+    );
+    const orderId = orderResult.rows[0].id;
+
+    // Get cart items
+    const cartItems = await client.query(
+      'SELECT c.product_id, c.quantity, p.stock_quantity FROM cart c JOIN product p ON c.product_id = p.id WHERE c.customer_id = $1',
+      [req.userId]
+    );
+
+    // Check stock and add order items
+    for (const item of cartItems.rows) {
+      if (item.quantity > item.stock_quantity) {
+        throw new Error(`Insufficient stock for product ID ${item.product_id}`);
+      }
+
+      await client.query(
+        'INSERT INTO order_item (order_id, product_id, quantity) VALUES ($1, $2, $3)',
+        [orderId, item.product_id, item.quantity]
+      );
+
+      // Update stock
+      await client.query(
+        'UPDATE product SET stock_quantity = stock_quantity - $1 WHERE id = $2',
+        [item.quantity, item.product_id]
+      );
+    }
+
+    // Clear cart
+    await client.query('DELETE FROM cart WHERE customer_id = $1', [req.userId]);
+
+    await client.query('COMMIT');
+    res.status(201).json({ message: 'Order created successfully', orderId });
+  } catch (error) {
+    await client.query('ROLLBACK');
+    res.status(400).json({ message: 'Error creating order', error: error.message });
+  } finally {
+    client.release();
+  }
+});
+
+// Product APIs
+
+app.get('/products', async (req, res) => {
+  const page = parseInt(req.query.page) || 1;
+  const limit = parseInt(req.query.limit) || 10;
+  const offset = (page - 1) * limit;
+  const category = req.query.category;
+
+  try {
+    let query = 'SELECT p.*, pc.name as category_name FROM product p JOIN product_category pc ON p.category_id = pc.id';
+    let countQuery = 'SELECT COUNT(*) FROM product p';
+    const queryParams = [];
+
+    if (category) {
+      query += ' WHERE pc.name = $1';
+      countQuery += ' JOIN product_category pc ON p.category_id = pc.id WHERE pc.name = $1';
+      queryParams.push(category);
+    }
+
+    query += ' LIMIT $' + (queryParams.length + 1) + ' OFFSET $' + (queryParams.length + 2);
+    queryParams.push(limit, offset);
+
+    const result = await pool.query(query, queryParams);
+    const countResult = await pool.query(countQuery, category ? [category] : []);
+    const totalProducts = parseInt(countResult.rows[0].count);
+    const totalPages = Math.ceil(totalProducts / limit);
+
+    res.json({
+      products: result.rows,
+      currentPage: page,
+      totalPages: totalPages,
+      totalProducts: totalProducts
+    });
+  } catch (error) {
+    res.status(500).json({ message: 'Error fetching products', error: error.message });
+  }
+});
+
+// New endpoint: Add a new product
+app.post('/products', verifyToken, isAdmin, async (req, res) => {
+  const { name, description, price, category_id, stock_quantity } = req.body;
+  try {
+    const result = await pool.query(
+      'INSERT INTO product (name, description, price, category_id, stock_quantity) VALUES ($1, $2, $3, $4, $5) RETURNING *',
+      [name, description, price, category_id, stock_quantity]
+    );
+    res.status(201).json(result.rows[0]);
+  } catch (error) {
+    res.status(400).json({ message: 'Error adding product', error: error.message });
+  }
+});
+
+// New endpoint: Update product details
+app.put('/products/:id', verifyToken, isAdmin, async (req, res) => {
+  const { id } = req.params;
+  const { name, description, price, category_id, stock_quantity } = req.body;
+  try {
+    const result = await pool.query(
+      'UPDATE product SET name = $1, description = $2, price = $3, category_id = $4, stock_quantity = $5 WHERE id = $6 RETURNING *',
+      [name, description, price, category_id, stock_quantity, id]
+    );
+    if (result.rows.length === 0) {
+      return res.status(404).json({ message: 'Product not found' });
+    }
+    res.json(result.rows[0]);
+  } catch (error) {
+    res.status(400).json({ message: 'Error updating product', error: error.message });
+  }
+});
+
+// New endpoint: Delete a product
+app.delete('/products/:id', verifyToken, isAdmin, async (req, res) => {
+  const { id } = req.params;
+  try {
+    const result = await pool.query('DELETE FROM product WHERE id = $1 RETURNING *', [id]);
+    if (result.rows.length === 0) {
+      return res.status(404).json({ message: 'Product not found' });
+    }
+    res.json({ message: 'Product deleted successfully' });
+  } catch (error) {
+    res.status(400).json({ message: 'Error deleting product', error: error.message });
+  }
+});
+
+// New endpoint: Update stock quantity
+app.patch('/products/:id/stock', verifyToken, isAdmin, async (req, res) => {
+  const { id } = req.params;
+  const { quantity } = req.body;
+  try {
+    const result = await pool.query(
+      'UPDATE product SET stock_quantity = stock_quantity + $1 WHERE id = $2 RETURNING *',
+      [quantity, id]
+    );
+    if (result.rows.length === 0) {
+      return res.status(404).json({ message: 'Product not found' });
+    }
+    res.json(result.rows[0]);
+  } catch (error) {
+    res.status(400).json({ message: 'Error updating stock', error: error.message });
+  }
+});
+
+
   // Start the server
   const PORT = process.env.PORT || 3000;
   app.listen(PORT, () => {
