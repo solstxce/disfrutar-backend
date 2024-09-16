@@ -6,7 +6,7 @@ const jwt = require('jsonwebtoken');
 const { OAuth2Client } = require('google-auth-library');
 const bcrypt = require('bcrypt');
 require('dotenv').config();
-
+const multer = require('multer');
 const app = express();
 app.use(express.json());
 
@@ -175,84 +175,134 @@ app.put('/user/profile', verifyToken, async (req, res) => {
 
 // Product APIs
 
-app.get('/products', async (req, res) => {
-  const page = parseInt(req.query.page) || 1;
-  const limit = parseInt(req.query.limit) || 10;
-  const offset = (page - 1) * limit;
-  const category = req.query.category;
-
-  try {
-    let query = 'SELECT p.*, pc.name as category_name FROM product p JOIN product_category pc ON p.category_id = pc.id';
-    let countQuery = 'SELECT COUNT(*) FROM product p';
-    const queryParams = [];
-
-    if (category) {
-      query += ' WHERE pc.name = $1';
-      countQuery += ' JOIN product_category pc ON p.category_id = pc.id WHERE pc.name = $1';
-      queryParams.push(category);
+const storage = multer.diskStorage({
+    destination: (req, file, cb) => {
+      const dir = './uploads/';
+      fs.mkdirSync(dir, { recursive: true });
+      cb(null, dir);
+    },
+    filename: (req, file, cb) => {
+      cb(null, Date.now() + path.extname(file.originalname));
     }
-
-    query += ' LIMIT $' + (queryParams.length + 1) + ' OFFSET $' + (queryParams.length + 2);
-    queryParams.push(limit, offset);
-
-    const result = await pool.query(query, queryParams);
-    const countResult = await pool.query(countQuery, category ? [category] : []);
-    const totalProducts = parseInt(countResult.rows[0].count);
-    const totalPages = Math.ceil(totalProducts / limit);
-
-    res.json({
-      products: result.rows,
-      currentPage: page,
-      totalPages: totalPages,
-      totalProducts: totalProducts
-    });
-  } catch (error) {
-    res.status(500).json({ message: 'Error fetching products', error: error.message });
-  }
-});
-
-app.post('/products', verifyToken, isAdmin, async (req, res) => {
-  const { name, description, price, category_id, stock_quantity } = req.body;
-  try {
-    const result = await pool.query(
-      'INSERT INTO product (name, description, price, category_id, stock_quantity) VALUES ($1, $2, $3, $4, $5) RETURNING *',
-      [name, description, price, category_id, stock_quantity]
-    );
-    res.status(201).json(result.rows[0]);
-  } catch (error) {
-    res.status(400).json({ message: 'Error adding product', error: error.message });
-  }
-});
-
-app.put('/products/:id', verifyToken, isAdmin, async (req, res) => {
-  const { id } = req.params;
-  const { name, description, price, category_id, stock_quantity } = req.body;
-  try {
-    const result = await pool.query(
-      'UPDATE product SET name = $1, description = $2, price = $3, category_id = $4, stock_quantity = $5 WHERE id = $6 RETURNING *',
-      [name, description, price, category_id, stock_quantity, id]
-    );
-    if (result.rows.length === 0) {
-      return res.status(404).json({ message: 'Product not found' });
+  });
+  
+  const upload = multer({ storage: storage });
+  
+  app.use(express.json());
+  app.use('/uploads', express.static('uploads'));
+  
+  app.get('/products', async (req, res) => {
+    const page = parseInt(req.query.page) || 1;
+    const limit = parseInt(req.query.limit) || 10;
+    const offset = (page - 1) * limit;
+    const category = req.query.category;
+  
+    try {
+      let query = 'SELECT p.*, pc.name as category_name FROM product p JOIN product_category pc ON p.category_id = pc.id';
+      let countQuery = 'SELECT COUNT(*) FROM product p';
+      const queryParams = [];
+  
+      if (category) {
+        query += ' WHERE pc.name = $1';
+        countQuery += ' JOIN product_category pc ON p.category_id = pc.id WHERE pc.name = $1';
+        queryParams.push(category);
+      }
+  
+      query += ' LIMIT $' + (queryParams.length + 1) + ' OFFSET $' + (queryParams.length + 2);
+      queryParams.push(limit, offset);
+  
+      const result = await pool.query(query, queryParams);
+      const countResult = await pool.query(countQuery, category ? [category] : []);
+      const totalProducts = parseInt(countResult.rows[0].count);
+      const totalPages = Math.ceil(totalProducts / limit);
+  
+      res.json({
+        products: result.rows,
+        currentPage: page,
+        totalPages: totalPages,
+        totalProducts: totalProducts
+      });
+    } catch (error) {
+      res.status(500).json({ message: 'Error fetching products', error: error.message });
     }
-    res.json(result.rows[0]);
-  } catch (error) {
-    res.status(400).json({ message: 'Error updating product', error: error.message });
-  }
-});
-
-app.delete('/products/:id', verifyToken, isAdmin, async (req, res) => {
-  const { id } = req.params;
-  try {
-    const result = await pool.query('DELETE FROM product WHERE id = $1 RETURNING *', [id]);
-    if (result.rows.length === 0) {
-      return res.status(404).json({ message: 'Product not found' });
+  });
+  
+  app.post('/products', verifyToken, isAdmin, upload.single('image'), async (req, res) => {
+    const { name, description, price, category_id, stock_quantity } = req.body;
+    const imagePath = req.file ? req.file.path : null;
+  
+    try {
+      const result = await pool.query(
+        'INSERT INTO product (name, description, price, category_id, stock_quantity, image_path) VALUES ($1, $2, $3, $4, $5, $6) RETURNING *',
+        [name, description, price, category_id, stock_quantity, imagePath]
+      );
+      res.status(201).json(result.rows[0]);
+    } catch (error) {
+      if (imagePath) {
+        fs.unlinkSync(imagePath); // Delete the uploaded file if database insertion fails
+      }
+      res.status(400).json({ message: 'Error adding product', error: error.message });
     }
-    res.json({ message: 'Product deleted successfully' });
-  } catch (error) {
-    res.status(400).json({ message: 'Error deleting product', error: error.message });
-  }
-});
+  });
+  
+  app.put('/products/:id', verifyToken, isAdmin, upload.single('image'), async (req, res) => {
+    const { id } = req.params;
+    const { name, description, price, category_id, stock_quantity } = req.body;
+    const imagePath = req.file ? req.file.path : null;
+  
+    try {
+      let query = 'UPDATE product SET name = $1, description = $2, price = $3, category_id = $4, stock_quantity = $5';
+      const queryParams = [name, description, price, category_id, stock_quantity];
+  
+      if (imagePath) {
+        query += ', image_path = $' + (queryParams.length + 1);
+        queryParams.push(imagePath);
+      }
+  
+      query += ' WHERE id = $' + (queryParams.length + 1) + ' RETURNING *';
+      queryParams.push(id);
+  
+      const result = await pool.query(query, queryParams);
+  
+      if (result.rows.length === 0) {
+        if (imagePath) {
+          fs.unlinkSync(imagePath); // Delete the uploaded file if product not found
+        }
+        return res.status(404).json({ message: 'Product not found' });
+      }
+  
+      // If a new image was uploaded, delete the old one
+      if (imagePath && result.rows[0].image_path && result.rows[0].image_path !== imagePath) {
+        fs.unlinkSync(result.rows[0].image_path);
+      }
+  
+      res.json(result.rows[0]);
+    } catch (error) {
+      if (imagePath) {
+        fs.unlinkSync(imagePath); // Delete the uploaded file if update fails
+      }
+      res.status(400).json({ message: 'Error updating product', error: error.message });
+    }
+  });
+  
+  app.delete('/products/:id', verifyToken, isAdmin, async (req, res) => {
+    const { id } = req.params;
+    try {
+      const result = await pool.query('DELETE FROM product WHERE id = $1 RETURNING *', [id]);
+      if (result.rows.length === 0) {
+        return res.status(404).json({ message: 'Product not found' });
+      }
+      
+      // Delete the associated image file if it exists
+      if (result.rows[0].image_path) {
+        fs.unlinkSync(result.rows[0].image_path);
+      }
+      
+      res.json({ message: 'Product deleted successfully' });
+    } catch (error) {
+      res.status(400).json({ message: 'Error deleting product', error: error.message });
+    }
+  });
 
 app.patch('/products/:id/stock', verifyToken, isAdmin, async (req, res) => {
   const { id } = req.params;
